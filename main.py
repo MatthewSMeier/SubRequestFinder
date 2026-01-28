@@ -1,14 +1,21 @@
-# main.py
+"""
+FastAPI API to fetch AoPS substitute requests
+- Bar chart: sub requests by day + time slot
+- Pie chart: sub requests by math class (from SUBJECT LINE)
+- Gmail IMAP
+- 24 hour caching
+"""
+
 import imaplib
 import email
+import os
 import re
 from collections import Counter
-import os
-import json
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # -----------------------------
 # CONFIG
@@ -18,90 +25,171 @@ IMAP_PORT = 993
 USERNAME = os.getenv("USERNAMEA")
 PASSWORD = os.getenv("PASSWORDA")
 
-app = FastAPI(title="AoPS Sub Requests API")
+CACHE_INTERVAL = timedelta(hours=24)
+
+VALID_CLASSES = [
+    "Math Level 1",
+    "Math Level 2",
+    "Math Level 3",
+    "Math Level 4",
+    "Math Level 5",
+    "Prealgebra",
+    "Algebra 1",
+    "Algebra 2",
+    "Geometry",
+    "Precalculus",
+    "Calculus",
+]
 
 # -----------------------------
-# CORS (for frontend access)
+# APP SETUP
 # -----------------------------
+app = FastAPI(title="AoPS Sub Requests API")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or your domain
+    allow_origins=["*"],  # tighten later for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-JSON_FILE = "sub_requests.json"
+# -----------------------------
+# CACHE
+# -----------------------------
+_cached_time_slots = None
+_cached_class_counts = None
+_cached_time = None
 
 # -----------------------------
-# FETCH EMAILS AND PARSE SUB REQUESTS
+# HELPERS
+# -----------------------------
+def extract_class_from_subject(subject: str):
+    if not subject:
+        return None
+
+    subject = subject.lower()
+
+    for cls in VALID_CLASSES:
+        if cls.lower() in subject:
+            return cls
+
+    return None
+
+# -----------------------------
+# FETCH + PARSE EMAILS
 # -----------------------------
 def fetch_last_200_sub_requests():
     mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
     mail.login(USERNAME, PASSWORD)
     mail.select("inbox")
 
-    status, data = mail.search(None, '(FROM "sandiego-cv@aopsacademy.org")')
-    email_ids = data[0].split()
-    if not email_ids:
-        mail.logout()
-        return []
+    status, data = mail.search(
+        None, '(FROM "sandiego-cv@aopsacademy.org")'
+    )
+    email_ids = data[0].split()[-200:]
 
-    last_200_ids = email_ids[-200:]
-    sub_day_times = []
+    time_slots = []
+    class_names = []
 
-    for e_id in last_200_ids:
-        status, msg_data = mail.fetch(e_id, "(RFC822)")
+    for e_id in email_ids:
+        _, msg_data = mail.fetch(e_id, "(RFC822)")
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
 
+        subject = msg["subject"] or ""
+
+        # -----------------------------
+        # BODY
+        # -----------------------------
         body = ""
         if msg.is_multipart():
             for part in msg.walk():
                 if part.get_content_type() == "text/plain":
-                    charset = part.get_content_charset() or "utf-8"
                     body += part.get_payload(decode=True).decode(
-                        charset, errors="ignore"
+                        part.get_content_charset() or "utf-8",
+                        errors="ignore",
                     )
         else:
-            charset = msg.get_content_charset() or "utf-8"
-            body = msg.get_payload(decode=True).decode(charset, errors="ignore")
+            body = msg.get_payload(decode=True).decode(
+                msg.get_content_charset() or "utf-8",
+                errors="ignore",
+            )
 
+        # Must be a real sub request
         if "A substitute has been requested for" not in body:
             continue
 
+        # -----------------------------
+        # TIME SLOT (BAR CHART)
+        # -----------------------------
         match = re.search(
-            r"begins (\w+) \w+ \d+(?:st|nd|rd|th)? at (\d{1,2}:\d{2}) ?(?:am|pm)? "
-            r"and ends at (\d{1,2}:\d{2}) ?(?:am|pm)?",
+            r"begins (\w+) .*? at (\d{1,2}:\d{2})\s*(am|pm)? "
+            r"and ends at (\d{1,2}:\d{2})\s*(am|pm)?",
             body,
             re.IGNORECASE,
         )
 
         if match:
-            day_of_week = match.group(1)
+            day = match.group(1)
             start_time = match.group(2)
-            end_time = match.group(3)
-            sub_day_times.append((day_of_week, f"{start_time} - {end_time}"))
+            end_time = match.group(4)
+            time_slots.append(f"{day} {start_time} - {end_time}")
+
+        # -----------------------------
+        # CLASS (PIE CHART)
+        # -----------------------------
+        class_name = extract_class_from_subject(subject)
+        if class_name:
+            class_names.append(class_name)
 
     mail.logout()
-    return sub_day_times
+    return time_slots, class_names
 
 # -----------------------------
-# GENERATE COUNTER AND SAVE JSON
+# CACHE HANDLER
 # -----------------------------
-def generate_counter_json():
-    sub_day_times = fetch_last_200_sub_requests()
-    counter = Counter()
-    for day, time_slot in sub_day_times:
-        counter[f"{day} {time_slot}"] += 1
-    with open(JSON_FILE, "w") as f:
-        json.dump(counter, f)
+def refresh_cache():
+    global _cached_time_slots, _cached_class_counts, _cached_time
+
+    slots, classes = fetch_last_200_sub_requests()
+
+    _cached_time_slots = dict(Counter(slots))
+    _cached_class_counts = dict(Counter(classes))
+    _cached_time = datetime.now()
+
+def ensure_cache():
+    global _cached_time
+
+    now = datetime.now()
+    if _cached_time is None or now - _cached_time > CACHE_INTERVAL:
+        refresh_cache()
 
 # -----------------------------
-# FASTAPI ENDPOINT
+# API ENDPOINTS
 # -----------------------------
-@app.get("/api/sub_requests_json")
-def serve_json():
-    if not os.path.exists(JSON_FILE):
-        generate_counter_json()
-    return FileResponse(JSON_FILE)
+@app.get("/api/sub_requests")
+def get_sub_requests():
+    """
+    Bar chart:
+    Sub requests grouped by day + time slot
+    Cached for 24 hours
+    """
+    ensure_cache()
+    return JSONResponse(content=_cached_time_slots)
+
+@app.get("/api/class_breakdown")
+def get_class_breakdown():
+    """
+    Pie chart:
+    Sub requests grouped by math class
+    (parsed from SUBJECT LINE)
+    Cached for 24 hours
+    """
+    ensure_cache()
+    return JSONResponse(content=_cached_class_counts)
+
+# -----------------------------
+# RUN:
+# python -m uvicorn main:app --reload
+# -----------------------------
